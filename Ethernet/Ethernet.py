@@ -1,7 +1,8 @@
 import socket
-from scapy.all import conf
+from scapy.all import conf, IFACES
 
 import Arp
+import IP
 from IP import parse_ip
 from Arp import parse_arp
 from Ipv6 import parse_ipv6
@@ -25,18 +26,23 @@ def bytes_to_mac(bytes_form):
     pretty_mac = ""
     index = 0
     while index < len(hexed_bytes):
-        pretty_mac += hexed_bytes[index]
-        pretty_mac += hexed_bytes[index + 1]
-        pretty_mac += ":"
+        pretty_mac += hexed_bytes[index: index + 2] + ":"
         index += 2
     return pretty_mac[:len(pretty_mac) - 1]
 
-def parse_ether_payload(ether_type, payload):
+def parse_ether_payload(ether_type, payload, arp_cache):
     response = None
     if ether_type in ETHERTYPE_PROTOCOL:
         name, parser = ETHERTYPE_PROTOCOL[ether_type]
         print(f"{name} packet!")
-        response = parser(payload)
+        # Handle special needs
+        if name == "ARP":
+            response = parser(payload, arp_cache)
+        # Save interface ip
+        elif name == "IPv4":
+            response = parser(payload, list(arp_cache.keys())[0])
+        else:
+            response = parser(payload)
     else:
         print(f"Unknown Ether type: {hex(ether_type)}")
     return response
@@ -45,52 +51,75 @@ def send_response(sock, src_mac, dst_mac, ether_type, response):
     reply = struct.pack(ETHERNET_FRAME_FORMAT, dst_mac, src_mac, ether_type) + response
     sock.send(reply)
 
-def listen(read_sock, write_sock, device_mac):
+def listen(socket, device_mac, arp_cache):
     while True:
-        packet = read_sock.recv_raw()  # Receive raw frame
-        # If received an empty packet, Extract the raw frame from packet tuple
+        # Receive raw frame
+        packet = socket.recv_raw()
+        # If received an empty packet drop it, Extract the raw frame from packet tuple
         if not packet or not (raw_frame := packet[1]):
             continue
         if len(raw_frame) < ETH_HEADER_LEN:
             continue
+
+        # Extract different fields according to Ethernet frame structure
         dst_mac, src_mac, ether_type = struct.unpack(ETHERNET_FRAME_FORMAT, raw_frame[:ETH_HEADER_LEN])
         payload = raw_frame[ETH_HEADER_LEN:]
+
         # If packet wasn't meant for device, drop it
-        # TODO - implement unicast
         if dst_mac != device_mac and dst_mac != BROADCAST_MAC:
             continue
+
         print(f"Frame received: \nDestination address: {bytes_to_mac(dst_mac)}, Source address: {bytes_to_mac(src_mac)},"
               f" Ether type: {hex(ether_type)}, Payload: {payload.hex()}")
-        response = parse_ether_payload(ether_type, payload)
+
+        # Parse the payload, check if got response
+        response = parse_ether_payload(ether_type, payload, arp_cache)
         if response:
             # Switch the src and dst addresses
-            send_response(write_sock, dst_mac, src_mac, ether_type, response)
+            send_response(socket, dst_mac, src_mac, ether_type, response)
 
-def init_device_info():
-    iface = conf.iface
-    if not iface:
-        raise RuntimeError("Could not find default interface")
-    my_ip = iface.ip
-    my_mac = iface.mac
-
-    if not my_ip or not my_mac:
+def init_device_info(iface):
+    if not iface.ip or not iface.mac:
         raise RuntimeError("Interface missing IP or MAC")
-    my_ip_bytes = socket.inet_aton(my_ip)
-    my_mac_bytes = bytes.fromhex(my_mac.replace(":", ""))
+
+    my_ip_bytes = socket.inet_aton(iface.ip)
+    my_mac_bytes = bytes.fromhex(iface.mac.replace(":", ""))
 
     return my_ip_bytes, my_mac_bytes, iface.name
 
+def list_interfaces():
+    print("Available interfaces:")
+    index = 1
+    for iface in IFACES.values():
+        name = iface.name or "(no name)"
+        ip = iface.ip or "no IP"
+        mac = iface.mac or "no MAC"
+        print(f"Index {index}: {name} | IP: {ip} | MAC: {mac}")
+        index += 1
+    return list(IFACES.values())
+
+def choose_interface():
+    interfaces = list_interfaces()
+    while True:
+        try:
+            index = int(input("Choose interface index: "))
+            if index >= 1 and index <= len(interfaces):
+                return interfaces[index - 1]
+            print("Invalid index.")
+        except ValueError:
+            print("Please enter a valid number.")
+
 def main():
     try:
-        my_ip_bytes, my_mac_bytes, iface_name = init_device_info()
-    except  RuntimeError as e:
+        iface = choose_interface()
+        my_ip_bytes, my_mac_bytes, iface_name = init_device_info(iface)
+    except RuntimeError as e:
         print(f"Network device initialization error: {e}")
         return
-    Arp.MY_IP = my_ip_bytes
-    Arp.ARP_CACHE = {my_ip_bytes: my_mac_bytes}
-    read_socket = conf.L2listen(iface=iface_name, promisc=True)
-    write_socket = conf.L2socket(iface=iface_name)
-    listen(read_socket, write_socket, my_mac_bytes)
+
+    arp_cache = {my_ip_bytes: my_mac_bytes}
+    socket = conf.L2socket(iface=iface_name, promisc=True)
+    listen(socket, my_mac_bytes, arp_cache)
 
 if __name__ == "__main__":
     main()
